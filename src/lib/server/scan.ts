@@ -15,6 +15,7 @@ import { BUZZ_TTL_MS, type XBuzz } from "./scan-x";
 import { xrayEvm, xrayFactors, xrayLive, type XRayReport } from "./scan-xray";
 import { t22Factors, xraySolana, type T22Report } from "./scan-t22";
 import { siteFactors, xraySite, type SiteReport } from "./scan-site";
+import { checkListing, listedByTicker, pinCore, type ListingCheck } from "./verified";
 import type { XRayView } from "@/components/xray-panel";
 
 export type Verdict = "CLEAN" | "OK" | "RISKY" | "DANGER" | "TOO_EARLY";
@@ -87,6 +88,24 @@ const CORE: Record<string, string> = {
   "0x8ac76a51cc950d9822d68b83fe1ad97b32cd580d": "USDC",
   "0xe9e7cea3dedca5984780bafc599bd69add087d56": "BUSD",
 };
+// Тикеры базовых активов: копию USDT или USDC ловим даже тогда, когда в списках CoinGecko у оригинала
+// другой символ (USDT на BNB Chain там записан как BSC-USD).
+const CORE_TICKERS: { chain: string; address: string; symbol: string }[] = [
+  { chain: "solana", address: "So11111111111111111111111111111111111111112", symbol: "SOL" },
+  { chain: "solana", address: "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v", symbol: "USDC" },
+  { chain: "solana", address: "Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB", symbol: "USDT" },
+  { chain: "solana", address: "JUPyiwrYJFskUPiHa7hkeR8VUtAeFoSYbKedZNsDvCN", symbol: "JUP" },
+  { chain: "solana", address: "J1toso1uCk3RLmjorhTtrVwY9HJ7X8V9yYac6Y7kGCPn", symbol: "JITOSOL" },
+  { chain: "solana", address: "mSoLzYCxHdYgdzU16g5QSh3i5K3z3KZK7ytfqcJm7So", symbol: "MSOL" },
+  { chain: "robinhood", address: "0x0bd7d308f8e1639fab988df18a8011f41eacad73", symbol: "WETH" },
+  { chain: "robinhood", address: "0x5fc5360d0400a0fd4f2af552add042d716f1d168", symbol: "USDG" },
+  { chain: "robinhood", address: "0x80e0e24718dbfcad49ecaa6f1e6c89a190586ca8", symbol: "USDC" },
+  { chain: "bsc", address: "0xbb4cdb9cbd36b01bd1cbaebf2de08d9173bc095c", symbol: "WBNB" },
+  { chain: "bsc", address: "0x55d398326f99059ff775485246999027b3197955", symbol: "USDT" },
+  { chain: "bsc", address: "0x8ac76a51cc950d9822d68b83fe1ad97b32cd580d", symbol: "USDC" },
+  { chain: "bsc", address: "0xe9e7cea3dedca5984780bafc599bd69add087d56", symbol: "BUSD" },
+];
+pinCore(CORE_TICKERS.map((c) => ({ ...c, name: CORE[c.address] ?? c.symbol })));
 // Сети, которые умеет сканер. Ключ — chainId DexScreener.
 export const SCAN_CHAINS: Record<string, string> = { solana: "Solana", robinhood: "Robinhood Chain", bsc: "BNB Chain" };
 const chainName = (c: string) => SCAN_CHAINS[c] ?? c;
@@ -94,6 +113,7 @@ const RECENT_KEY = "recentScans";
 const SAVED_KEY = "scanResults";
 const SAVED_MAX = 200;
 const CACHE_MS = 2 * 60_000;
+const OLDER_TWIN_MS = 30 * 86_400_000; // на сколько раньше должен появиться «оригинал», чтобы мы ему поверили
 
 // Символы бывают записаны как «$WIF»: сравниваем без знака доллара и регистра.
 const sym = (s?: string) => (s ?? "").replace(/^\$/, "").toUpperCase();
@@ -170,11 +190,31 @@ async function resolve(q: string, log: (l: ScanLog) => void, hint = "solana"): P
   const ticker = s.replace(/^\$/, "").toUpperCase();
   if (!/^[A-Z0-9]{2,12}$/.test(ticker)) throw new Error("Paste a token contract address or a $TICKER");
   log({ crawler: "resolver", text: `looking up $${ticker} on ${chainName(net)}…` });
-  const pairs = (await searchTicker(ticker)).filter((p) => p.chainId === net && sym(p.baseToken.symbol) === ticker);
-  pairs.sort((a, b) => (b.liquidity?.usd ?? 0) - (a.liquidity?.usd ?? 0));
-  if (!pairs[0]) throw new Error(`No ${chainName(net)} token with ticker $${ticker}`);
+  const [found, listed] = await Promise.all([searchTicker(ticker), listedByTicker(net, ticker).catch(() => [])]);
+  const pairs = found.filter((p) => p.chainId === net && sym(p.baseToken.symbol) === ticker);
+  // Ликвидность подделка накручивает, поэтому порядок такой: базовый актив, проверенный Jupiter, есть в CoinGecko,
+  // и только потом самый ликвидный.
+  const RANK = { Core: 3, Jupiter: 2, CoinGecko: 1 } as const;
+  const rankOf = (address: string) => {
+    const t = listed.find((x) => x.address === address || x.address.toLowerCase() === address.toLowerCase());
+    return t ? RANK[t.source] : 0;
+  };
+  pairs.sort((a, b) => rankOf(b.baseToken.address) - rankOf(a.baseToken.address) || (b.liquidity?.usd ?? 0) - (a.liquidity?.usd ?? 0));
   const others = new Set(pairs.map((p) => p.baseToken.address)).size - 1;
-  log({ crawler: "resolver", text: `picked the most liquid $${ticker}${others ? ` (${others} more share this ticker)` : ""}`, tone: others ? "warn" : "info" });
+  const best = listed[0];
+  if (best && RANK[best.source] > (pairs[0] ? rankOf(pairs[0].baseToken.address) : 0)) {
+    // Поиск DexScreener не вернул лучший проверенный токен (его забили копии) — берём адрес прямо из списка.
+    log({ crawler: "resolver", text: `picked the verified $${ticker} (${best.source === "Core" ? "core asset" : `${best.source} list`})${pairs.length ? `, not the ${others + 1} lookalike${others ? "s" : ""} in search` : ""}`, tone: "info" });
+    return { chain: net, address: best.address };
+  }
+  if (!pairs[0]) throw new Error(`No ${chainName(net)} token with ticker $${ticker}`);
+  log({
+    crawler: "resolver",
+    text: rankOf(pairs[0].baseToken.address)
+      ? `picked the verified $${ticker}${others ? ` (${others} more share this ticker)` : ""}`
+      : `picked the most liquid $${ticker}${others ? ` (${others} more share this ticker)` : ""}`,
+    tone: others ? "warn" : "info",
+  });
   return { chain: net, address: pairs[0].baseToken.address, pair: pairs[0] };
 }
 
@@ -369,10 +409,36 @@ export async function runScan(
           .catch(() => undefined)
       : Promise.resolve(undefined);
 
+  // Списки Jupiter / CoinGecko: оригинал там есть, подделка с тем же тикером — нет.
+  const listingP: Promise<ListingCheck> =
+    symbol && !core
+      ? checkListing(chain, address, symbol, market?.pair.baseToken.name ?? "")
+          .then((c) => {
+            const real = "real" in c ? `${c.real.name} (${c.real.address.slice(0, 4)}…${c.real.address.slice(-4)}${c.real.chain !== chain ? ` on ${chainName(c.real.chain)}` : ""})` : "";
+            if (c.kind !== "unknown")
+              log({
+                crawler: "crawler_clones",
+                text:
+                  c.kind === "listed"
+                    ? `on the ${c.token.source} verified list: the real $${symbol}`
+                    : c.kind === "impersonator"
+                      ? `not on the verified lists, but the real $${symbol} is: ${real}. This looks like an impersonator`
+                      : c.kind === "copy-elsewhere"
+                        ? `not on the verified lists; a verified token with this name lives elsewhere: ${real}`
+                        : c.kind === "ticker-squat"
+                          ? `uses the ticker of a bigger verified token: ${real}`
+                          : `the verified $${symbol} is a different token: ${real}`,
+                tone: c.kind === "listed" ? "ok" : c.kind === "impersonator" ? "bad" : "warn",
+              });
+            return c;
+          })
+          .catch((): ListingCheck => ({ kind: "unknown" }))
+      : Promise.resolve<ListingCheck>({ kind: "unknown" });
+
   // Клоны: другие токены с тем же тикером. Если у кого-то из них ликвидность больше, этот, скорее всего, копия.
   const clonesP: Promise<{ n: number; biggerTwin?: number; original?: boolean }> = symbol && !core
-    ? searchTicker(sym(symbol))
-        .then((pairs) => {
+    ? Promise.all([searchTicker(sym(symbol)), listingP])
+        .then(([pairs, listing]) => {
           const same = pairs.filter((p) => p.chainId === chain && sym(p.baseToken.symbol) === sym(symbol));
           // Сравниваем по капитализации: у копии она на порядки меньше, даже если в одном пуле много ликвидности.
           const others = new Map<string, { fdv: number; liq: number; born: number }>();
@@ -391,25 +457,31 @@ export async function runScan(
           const mineFdv = market?.pair.fdv ?? 0;
           // Без FDV (так бывает у wrapped-активов) сравниваем по ликвидности пула.
           const mineLiq = market?.pair.liquidity?.usd ?? 0;
-          const twin = [...others.values()]
+          // FDV копия накручивает, а возраст подделать нельзя: живой токен с тем же тикером, торгующийся
+          // на месяц дольше нашего, — скорее оригинал, даже если «наш» показывает FDV больше.
+          const older = (o: { fdv: number; born: number }) => Number.isFinite(mineBorn) && o.born + OLDER_TWIN_MS < mineBorn && o.fdv >= 1_000_000;
+          let twin: { fdv: number; liq: number; born: number } | undefined = [...others.values()]
             // Крупный «двойник», запущенный позже нашего токена, — сам копия с накрученной FDV, а не оригинал.
-            .filter((o) => o.liq > 20_000 && !(o.born > mineBorn) && (mineFdv ? o.fdv > Math.max(mineFdv * 5, 100_000) : o.liq > mineLiq * 5))
-            .sort((x, y) => y.fdv - x.fdv)[0];
+            .filter((o) => o.liq > 20_000 && !(o.born > mineBorn) && ((mineFdv ? o.fdv > Math.max(mineFdv * 5, 100_000) : o.liq > mineLiq * 5) || older(o)))
+            .sort((x, y) => x.born - y.born)[0];
+          // Проверенный токен не копия; токен, у которого проверенный двойник, — не оригинал.
+          if (listing.kind === "listed") twin = undefined;
+          const canBeOriginal = !["impersonator", "ticker-squat", "ticker-taken", "copy-elsewhere"].includes(listing.kind);
           const biggerTwin = twin?.fdv;
           const top = Math.max(0, ...[...others.values()].filter((o) => !(o.born > mineBorn)).map((o) => o.fdv));
           const mine = mineFdv;
           log({
             crawler: "crawler_clones",
-            text: biggerTwin
-              ? `a bigger token already uses $${sym(symbol)} (${usd(biggerTwin)} FDV): this may be a copy`
-              : n > 0 && mine >= top
+            text: twin
+              ? `${older(twin) ? `an older token (${Math.round((mineBorn - twin.born) / 86_400_000)}d earlier)` : "a bigger token"} already uses $${sym(symbol)} (${usd(twin.fdv)} FDV): this may be a copy`
+              : n > 0 && mine >= top && canBeOriginal
                 ? `the original $${sym(symbol)}: the biggest of ${n + 1} tokens with this ticker`
                 : n > 0
                 ? `${n} other token${n > 1 ? "s use" : " uses"} the ticker $${sym(symbol)}`
                 : `ticker $${sym(symbol)} is unique on ${chainName(chain)}`,
             tone: biggerTwin ? "bad" : n > 2 ? "warn" : "ok",
           });
-          return { n, biggerTwin, original: n > 0 && mine >= top };
+          return { n, biggerTwin, original: n > 0 && mine >= top && canBeOriginal };
         })
         .catch(() => ({ n: 0 }))
     : Promise.resolve({ n: 0 });
@@ -438,7 +510,9 @@ export async function runScan(
     return found;
   });
 
-  const [holders, cloneInfo, telegram, bundles, dev, evm, xr, siteR] = await Promise.all([holdersP, clonesP, tgP, bundlesP, devP, evmP, xrayP, siteP]);
+  const [holders, clonesRaw, telegram, bundles, dev, evm, xr, siteR, listing] = await Promise.all([holdersP, clonesP, tgP, bundlesP, devP, evmP, xrayP, siteP, listingP]);
+  // Токен из проверенного списка и есть оригинал, какие бы цифры ни показывали его копии.
+  const cloneInfo: { n: number; biggerTwin?: number; original?: boolean } = listing.kind === "listed" ? { n: clonesRaw.n, original: true } : clonesRaw;
   let xray = xr && "program" in xr ? xrayViewSol(xr) : xr ? xrayViewEvm(xr, !!evm?.owner) : undefined;
   if (siteR) {
     const siteView = { host: siteR.host, wallet: siteR.wallet, error: siteR.error, findings: siteR.findings.map((f) => ({ label: f.label, note: f.note, severity: f.severity, detail: f.evidence })) };
@@ -475,7 +549,9 @@ export async function runScan(
     else if (prior >= 3 && dev.graduated / prior < 0.1) hit("Weak dev record", -10, `${dev.graduated} of ${prior} earlier launches by this creator graduated`);
     else if (dev.graduated >= 2 && dev.graduated / prior >= 0.3) hit("Dev track record", 5, `${dev.graduated} of ${prior} earlier launches by this creator graduated`);
     if (dev.walletAgeHours !== undefined && dev.walletAgeHours < 24) hit("Fresh dev wallet", -5, `the creator wallet is ${dev.walletAgeHours.toFixed(1)}h old`);
-    if (dev.holdsPct !== undefined && dev.holdsPct > 10) hit("Dev holds a lot", -10, `the creator still holds ${pct(dev.holdsPct)}`);
+    // Создатель с половиной эмиссии может в любой момент обрушить цену сам: это не «немного много».
+    if (dev.holdsPct !== undefined && dev.holdsPct > 50) hit("Dev holds most", -30, `the creator still holds ${pct(dev.holdsPct)}`);
+    else if (dev.holdsPct !== undefined && dev.holdsPct > 10) hit("Dev holds a lot", -10, `the creator still holds ${pct(dev.holdsPct)}`);
   }
   if (evm) {
     if (evm.honeypot) hit("Honeypot", -60, "GeckoTerminal flags it: you can buy but not sell");
@@ -487,7 +563,12 @@ export async function runScan(
   if (xr && "program" in xr) for (const f of t22Factors(xr)) hit(f.label, f.impact, f.note);
   else if (xr) for (const f of xrayFactors(xr, !!evm?.owner)) hit(f.label, f.impact, f.note);
   if (siteR) for (const f of siteFactors(siteR)) hit(f.label, f.impact, f.note);
-  if (cloneInfo.biggerTwin) hit("Possible copy", -45, `a token worth ${usd(cloneInfo.biggerTwin)} already uses this ticker`);
+  const realAt = (t: { address: string; chain: string }) => `${t.address.slice(0, 4)}…${t.address.slice(-4)}${t.chain !== chain ? ` on ${chainName(t.chain)}` : ""}`;
+  if (listing.kind === "impersonator") hit("Impersonator", -60, `the verified $${symbol} is a different token (${realAt(listing.real)}): this one copies its name`);
+  else if (cloneInfo.biggerTwin) hit("Possible copy", -45, `a token worth ${usd(cloneInfo.biggerTwin)} already uses this ticker`);
+  else if (listing.kind === "copy-elsewhere") hit("Possible copy", -30, `the verified ${listing.real.name} is ${realAt(listing.real)}, not this token`);
+  else if (listing.kind === "ticker-squat") hit("Ticker squat", -25, `$${symbol} belongs to the verified ${listing.real.name} (${realAt(listing.real)})`);
+  else if (listing.kind === "ticker-taken") hit("Ticker taken", -10, `the verified $${symbol} is a different token (${realAt(listing.real)})`);
   else if (clones > 2 && !cloneInfo.original) hit("Copycats", -10, `${clones} other tokens share the ticker`);
   const buys = p?.txns?.h1?.buys ?? 0;
   const sells = p?.txns?.h1?.sells ?? 0;
@@ -498,10 +579,12 @@ export async function runScan(
   if (telegram.length) hit("On the radar", 5, `mentioned in ${telegram.map((t) => t.channel).join(", ")}`);
   for (const f of factors) score += f.impact;
   score = Math.max(0, Math.min(100, score));
+  // Подделка под проверенный токен — DANGER при любых остальных цифрах: она и выглядит хорошо, чтобы обмануть.
+  if (listing.kind === "impersonator") score = Math.min(score, 35);
   // Жёсткое правило по данным Track Record (13.10): молодые токены со связанными или свежими кошельками
   // в первые часы массово рушились на 60–98% при вердикте OK/CLEAN. Взвешенная сумма тут обманывает:
   // такой токен не выше RISKY, сколько бы баллов он ни набрал.
-  const YOUNG_RISK = ["Bundled", "Linked wallets", "Fresh dev wallet", "Fresh wallets", "Owner active", "Dev holds a lot"];
+  const YOUNG_RISK = ["Bundled", "Linked wallets", "Fresh dev wallet", "Fresh wallets", "Owner active", "Dev holds a lot", "Dev holds most"];
   const youngFlag = market?.ageHours !== undefined && market.ageHours < 24 ? factors.find((f) => YOUNG_RISK.includes(f.label)) : undefined;
   if (youngFlag && score >= 60) {
     hit("Young and linked", -(score - 59), `under a day old with "${youngFlag.label.toLowerCase()}": such launches often dump in the first hours`);
@@ -510,7 +593,7 @@ export async function runScan(
 
   // «Слишком рано» — только если явных красных флагов нет: связанные кошельки или серийного создателя видно
   // уже в первые минуты, и молчать о них нельзя.
-  const SERIOUS = ["Bundled", "Linked wallets", "Fresh wallets", "Serial launcher", "Possible copy", "Dev holds a lot", "Concentrated"];
+  const SERIOUS = ["Bundled", "Linked wallets", "Fresh wallets", "Serial launcher", "Possible copy", "Impersonator", "Ticker squat", "Dev holds a lot", "Dev holds most", "Concentrated"];
   const tooEarly =
     !!market && market.ageHours !== undefined && market.ageHours < 0.5 && !holders?.mintAuthority && !holders?.freezeAuthority && !evm?.honeypot && !xray?.findings.some((f) => f.severity === "high") && !factors.some((f) => SERIOUS.includes(f.label));
   const verdict: Verdict = tooEarly ? "TOO_EARLY" : score >= 80 ? "CLEAN" : score >= 60 ? "OK" : score >= 40 ? "RISKY" : "DANGER";
