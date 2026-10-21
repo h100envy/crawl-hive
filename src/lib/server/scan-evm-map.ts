@@ -78,8 +78,10 @@ type TLog = { from: string; to: string; value: bigint; tx: Hex; block: bigint };
 
 async function transfers(c: PublicClient, token: Hex, w: { head: bigint; chunk: bigint; from: bigint }, args?: { to: Hex[] }): Promise<TLog[]> {
   const out: TLog[] = [];
+  // Ошибку страницы логов не глушим: пропущенная страница дала бы неверные балансы и связи. Временные сбои (429, 5xx)
+  // повторяет транспорт viem; если страница так и не пришла (у Robinhood — «exceeds limit of 10000»), карту не строим.
   for (let b = w.from, n = 0; b <= w.head && n < MAX_CHUNKS && out.length < MAX_LOGS; b += w.chunk, n++) {
-    const logs = await c.getLogs({ address: token, event: TRANSFER, ...(args ? { args } : {}), fromBlock: b, toBlock: b + w.chunk - 1n > w.head ? w.head : b + w.chunk - 1n }).catch(() => []);
+    const logs = await c.getLogs({ address: token, event: TRANSFER, ...(args ? { args } : {}), fromBlock: b, toBlock: b + w.chunk - 1n > w.head ? w.head : b + w.chunk - 1n });
     for (const l of logs) out.push({ from: (l.args.from ?? "").toLowerCase(), to: (l.args.to ?? "").toLowerCase(), value: l.args.value ?? 0n, tx: l.transactionHash, block: l.blockNumber });
   }
   return out;
