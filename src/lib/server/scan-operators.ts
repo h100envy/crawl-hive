@@ -8,6 +8,7 @@ import { getMeta, setMeta } from "./store";
 import { cachedFunding, EXCHANGE_SOL, funderSol, type BundleReport } from "./scan-bundles";
 import type { SniperReport } from "./scan-snipers";
 import { trackOutcomes } from "./track";
+import { recentDevWalletsFrom } from "./wallet-mem-select";
 
 export type Role = "bundle" | "dev" | "sniper";
 export interface Operator {
@@ -241,6 +242,12 @@ export function walletEntries(wallet: string): { token: string; chain: string; r
   return entries(loadMem()[norm(wallet)]).map((e) => ({ token: e.t, chain: e.c, role: e.r }));
 }
 export const walletMemSize = () => Object.keys(loadMem()).length;
+
+// Кошельки-деверы для sitemap.xml: /dev/<кошелёк> реально ищут в Google по адресу, но страница появлялась
+// в индексе только через внешние ссылки. Выбор — чистая функция в wallet-mem-select.ts (легко тестировать).
+export function recentDevWallets(limit = 150): string[] {
+  return recentDevWalletsFrom(loadMem(), limit);
+}
 
 // Эти кошельки на ДРУГИХ токенах: сколько токенов и сколько из них рухнули (только закрытые исходы).
 export function walletHistory(wallets: string[], token: string) {

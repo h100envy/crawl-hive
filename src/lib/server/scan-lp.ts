@@ -3,6 +3,7 @@
 // в главном пуле, локеры с датами), BNB Chain и Base — по GoPlus (держатели LP-токена, отметка лока и дата окончания).
 // Монеты на кривой лаунчпада LP ещё не имеют — вытащить нечего. Для Robinhood Chain источника пока нет.
 import "server-only";
+import { goplusEndTimeMs } from "./goplus-time";
 
 export interface LpReport {
   status: "burned" | "locked" | "partly" | "unlocked" | "curve" | "unknown";
@@ -88,8 +89,8 @@ async function fromGoplus(token: string, chainId: number, pool?: string): Promis
     else if (h.is_locked === 1) {
       locked += p;
       for (const d of h.locked_detail ?? []) {
-        const end = d.end_time ? Date.parse(d.end_time) : NaN;
-        if (Number.isFinite(end) && end > Date.now() && (!unlockAt || end < unlockAt)) {
+        const end = goplusEndTimeMs(d.end_time);
+        if (end !== undefined && end > Date.now() && (!unlockAt || end < unlockAt)) {
           unlockAt = end;
           locker = h.tag || undefined;
         }

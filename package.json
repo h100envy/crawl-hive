@@ -5,7 +5,8 @@
   "scripts": {
     "dev": "next dev",
     "build": "next build",
-    "start": "next start"
+    "start": "next start",
+    "test": "node --test 'src/**/*.test.ts'"
   },
   "dependencies": {
     "@babel/parser": "7.29.9",
